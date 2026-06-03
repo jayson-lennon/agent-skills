@@ -1,6 +1,6 @@
 My collection of [agent skills](https://agentskills.io/home).
 
-Install to:
+Installation:
 
-- globally: `~/.agents/skills`
-- project: `.agents/skills`
+- Globally: `~/.agents/skills`
+- Project-specific: `.agents/skills`
