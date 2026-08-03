@@ -1,13 +1,11 @@
 ---
 name: rust-programming
-description: Rust code quality rules that eliminate technical debt. Activates on any Rust coding task. Enforces aggressive newtypes, subsystem-level context structs, loop isolation, block scoping, service traits with DI, and error_stack error handling. Every rule has concrete positive and negative code examples.
+description: Rust code quality rules that eliminate technical debt and improve program reliability. Activate on all Rust coding tasks.
 ---
 
 # Rust Programming
 
 You are an expert Rust software developer prioritizing developer UX and code maintainability.
-
-**Load [references/testing-patterns.md](references/testing-patterns.md) when writing tests.**
 
 ---
 
@@ -128,12 +126,51 @@ fn place_order(ctx: &OrderContext) { /* ... */ }
 // This function is the ONLY consumer. Just pass db and user_id directly.
 ```
 
+### When a Global Context Already Exists
+
+The "context struct" is often a single application-wide container (commonly named
+`Services`). When that global context exists, it IS the context struct for every
+function that needs a service. Reaching into it and passing a piece onward is the same
+anti-pattern as threading individual capabilities — it re-fragments the bundle the
+context exists to prevent.
+
+```rust
+// ❌ BAD - pulling a piece out of the global context
+fn resolve(fs: &FsService, asset: &Path) -> ResolvedAsset { /* ... */ }
+// Caller: resolve(&services.fs, asset)
+// Adding a second dependency means changing the signature AND every call site.
+
+// ✅ GOOD - the function takes the whole context
+fn resolve(services: &Services, asset: &Path) -> ResolvedAsset { /* ... */ }
+// Caller: resolve(&services, asset). New capabilities are free.
+```
+
+A per-subsystem `Ctx` (e.g. `RenderCtx`) is warranted only when it carries
+**additional local state** beyond the global services — a theme, a viewport,
+per-request data. If your `Ctx` only forwards `&Services` plus a value or two,
+fold those values into `Services` and delete the `Ctx`.
+
+```rust
+// ❌ BAD - a Ctx that only forwards Services + one borrowed value
+struct AuditCtx<'a> { services: &'a Services, config: &'a Config, root: &'a Path }
+fn run_audit(ctx: &AuditCtx) { /* reads ctx.services, ctx.config, ctx.root */ }
+// `config` and `root` belong IN Services. This struct adds indirection for nothing.
+
+// ✅ GOOD - fold the values into Services, take the whole thing
+fn run_audit(services: &Services) { /* reads services.config() */ }
+```
+
 ### The Rule
 
 Create a context struct when **three or more functions** in a subsystem share the same
 dependency set. The context struct holds "what the subsystem needs"; individual parameters
 hold "what this specific function needs." If only one or two functions consume it, use
 plain parameters.
+
+The "three or more functions" heuristic decides when to create a *new subsystem* context.
+It does **not** gate the global `Services` container, which is passed to any function that
+even remotely needs it — passing the whole thing everywhere is the *point*: it eliminates
+the churn of adding a capability later.
 
 ---
 
@@ -261,6 +298,23 @@ let adjusted = {
 // Easy to extract into a function later since the block is already self-contained.
 ```
 
+### The Canonical Case: Assembling `Services`
+
+`Services` is the textbook create-then-configure. At the single program entry point,
+build every backend in one block. Throwaway pieces — a root-discovery probe, the
+`FsService` used to load config/registry — live only inside the block; the final
+`Services` is immutable and escapes. Build each real backend **once** and reuse it.
+
+```rust
+let services = {
+    let fs = FsService::new(Arc::new(RealFs::new()));     // built once
+    let registry = RegistryService::load(&fs, &root)?;     // bootstrap exception
+    let clock = ClockService::new(Arc::new(RealClock::new()));
+    let config = ConfigService::load(&fs, &root)?;         // bootstrap exception
+    Services { fs, registry, clock, config }               // immutable, escapes
+};
+```
+
 ### The Rule
 
 If a value requires mutability for setup, scope the setup in a block so the final
@@ -321,18 +375,54 @@ impl SessionStoreService {
 
 ### Services Container
 
+`Services` is the application-wide **dependency injection container** — one instance
+constructed at program entry and shared by reference everywhere. It bundles every
+service the program might need, so adding a capability later is a one-field change with
+zero call-site churn.
+
 ```rust
 // ✅ GOOD - created once at startup, shared throughout the application
 #[derive(Debug, Clone)]
 pub struct Services {
-    pub session_store: SessionStoreService,
-    pub llm_service: LlmServiceFactoryService,
-    pub config_storage: ConfigStorageService,
+    pub session_store: SessionStoreService,   // trait-backed (behavior)
+    pub llm: LlmService,                       // trait-backed (behavior)
+    pub config: ConfigService,                 // Arc<Config> (data)
     // ...
 }
-// Every field is a service wrapper - cheap to clone, shared via Arc.
-// Tests construct with fakes. Production constructs with real backends.
+// Every field satisfies ONE of two clauses:
+//  - cheap to clone (Arc<T> of data), OR
+//  - behind a trait (Arc<dyn Trait> service wrapper).
+// Both are valid. Never a bare owned HashMap/struct that deep-copies on clone.
 ```
+
+### Behavior Services vs Data Services — Which Clause Applies?
+
+Decide per field with one question: **is there a *behavior* to swap, or only *data*?**
+
+- **Behavior service** — the *implementation* varies (filesystem, clock, network, DB).
+  Trait + `Arc<dyn Trait>` wrapper. Tests swap the backend.
+- **Data service** — pure data loaded *through* an already-abstracted service, with no
+  behavior to swap (a parsed config cache, a registry read as data). `Arc<T>` concrete,
+  cheap to clone. No trait: the *data* is the test seam, swapped via a builder.
+
+```rust
+// Behavior: implementation varies → trait + wrapper
+pub trait ClockBackend: Send + Sync {
+    fn now(&self) -> u64;
+    fn name(&self) -> &'static str;
+}
+pub struct ClockService { backend: Arc<dyn ClockBackend> }   // RealClock / FakeClock
+
+// Data: loaded via FsBackend, nothing to swap → Arc<T>, no trait
+pub struct ConfigService {
+    root: Arc<Path>,
+    config: Arc<Config>,
+}
+// Tests swap the *data* (Config::default(), a builder), not a backend.
+```
+
+A project may mandate trait-backing for uniformity even on data fields — that's a valid
+project override, not the default the skill teaches.
 
 ### The Anti-Pattern
 
@@ -348,11 +438,30 @@ fn save_session(store: &SqliteSessionStore, session: &Session) { /* ... */ }
 ### The Rules
 
 - Every service has a trait. Every trait has a colocated error type.
-- Service structs wrap `Arc<dyn Trait>` - never expose the trait object directly.
+- Behavior service structs wrap `Arc<dyn Trait>` - never expose the trait object directly.
+- Every `Services` field is either a trait-backed service wrapper or an `Arc<T>` of data - never a bare owned collection that deep-copies on clone.
 - Service wrappers include a `name()` method for debugging.
-- The `Services` container is the DI container - one instance, shared everywhere.
+- The `Services` container is the **application-wide DI container** - **one instance, shared everywhere**.
 - Traits live in the same module as the types that implement them, never in standalone files.
 - `#[async_trait]` for async methods.
+
+### Bootstrap Exceptions — When a Raw Service Piece Is Correct
+
+Some functions must take a raw `&FsService` rather than `&Services` because they run
+*before* the container exists: they are the factories that build the backends (root
+discovery, config load, registry load). These are confined to:
+
+- the single assembly block at program entry, and
+- test seeding.
+
+They are not a reach-in violation — you cannot inject a container that hasn't been built.
+But they must never appear in the runtime call graph *below* the assembly block.
+
+```rust
+// Bootstrap factory: takes &FsService because Services doesn't exist yet.
+pub fn load(fs: &FsService, root: &Path) -> Result<Config, Report<ConfigError>> { /* ... */ }
+// Called ONLY from the main assembly block or test seeding. Never from a command.
+```
 
 ---
 
@@ -380,7 +489,7 @@ use error_stack::{Report, ResultExt};
 pub fn load_config(path: &Path) -> Result<Config, Report<ConfigError>> {
     let content = std::fs::read_to_string(path)
         .change_context(ConfigError)
-        .attach(printable::path(path))
+        .attach(path.to_string_lossy())
         .attach("failed to read config file")?;
     Ok(parse_config(&content))
 }
@@ -408,8 +517,326 @@ pub fn save(&self, session: &Session) -> Result<(), Report<SessionStoreError>>
 
 ---
 
-## Cross-References
+## 7. Testing Patterns
 
-- **[Testing Patterns](references/testing-patterns.md)** - Load when writing any test code.
-  Covers BDD structure, one-test-one-behavior, observable behavior only, rstest parameterization,
-  and test utilities.
+### One Test, One Behavior
+
+Every test asserts exactly one semantic concept. When it fails, the test name alone tells you
+_what_ broke. A test has exactly one `// When` and one `// Then` block. A `// Then` may have
+`// And` lines, but only when they elaborate on the same behavior - never a different one.
+
+#### What Counts as One Concept
+
+```rust
+// ✅ ONE concept - checking multiple fields of the same result
+#[test]
+fn parse_returns_correct_id_and_name() {
+    // Given a raw config string.
+    let raw = "id: abc\nname: test";
+
+    // When parsing.
+    let result = parse(raw);
+
+    // Then the id is "abc".
+    assert_eq!(result.id, "abc");
+    // And the name is "test".
+    assert_eq!(result.name, "test");
+}
+// Both assertions confirm "the parse result is correct." One concept.
+```
+
+#### What Counts as Separate Concepts - Split Into Separate Tests
+
+```rust
+// ❌ BAD - two When/Then blocks in one test
+#[test]
+fn stream_token_appends_to_assistant_entry() {
+    // ...setup...
+    // When processing the first token.
+    // Then the entry has "Hello".
+    // When processing a second token.
+    // Then the text is "Hello world".
+}
+
+// ✅ GOOD - split into two tests
+#[test]
+fn first_stream_token_creates_assistant_entry() {
+    // ...setup...
+    // When processing StreamToken("Hello").
+    // Then the session has an Assistant entry with "Hello".
+}
+
+#[test]
+fn subsequent_stream_token_appends_to_existing_entry() {
+    // ...setup with one token already processed...
+    // When processing another StreamToken(" world").
+    // Then the text is "Hello world".
+}
+```
+
+```rust
+// ❌ BAD - checking state change AND command emission in one test
+#[test]
+fn submit_message_clears_input_and_enqueues() {
+    // ...setup...
+    // When submitting a message.
+    // Then the input buffer is cleared.
+    // And EnqueueUserMessage was returned.
+}
+
+// ✅ GOOD - split into separate tests
+#[test]
+fn submit_message_clears_input_buffer() {
+    // ...setup...
+    // When handling Intent::SubmitMessage.
+    // Then the input buffer is empty.
+}
+
+#[test]
+fn submit_message_returns_enqueue_command() {
+    // ...setup...
+    // When handling Intent::SubmitMessage.
+    // Then the result contains EnqueueUserMessage.
+}
+```
+
+```rust
+// ❌ BAD - checking multiple entry type renders in one test
+#[test]
+fn render_mixed_entries() {
+    // Given system, user, actor, and assistant entries.
+    // When rendering.
+    // Then line 6 is system (dark gray).
+    // And line 7 is user (">" prefix, bold).
+    // And line 8 is actor (yellow).
+    // And line 9 is assistant (cyan).
+}
+
+// ✅ GOOD - one test per entry type
+#[test]
+fn render_system_entry_is_dark_gray() {
+    // Given a ChatLogElement with a system entry.
+    // When rendering.
+    // Then the system entry line has dark gray foreground.
+}
+
+#[test]
+fn render_user_entry_has_prefix() {
+    // Given a ChatLogElement with a user entry.
+    // When rendering.
+    // Then the user entry line starts with ">".
+}
+```
+
+#### The Rule
+
+Duplicated test setup is acceptable. Do not combine tests to avoid setup duplication.
+Each `#[test]` function answers exactly one question about the system.
+
+---
+
+### BDD-Style Structure - Given / When / Then
+
+Every test has three sections in order: Given, When, Then. Use `//` comments to mark them.
+The test name reads as a standalone behavior description in the test report.
+
+#### Basic Pattern
+
+```rust
+#[test]
+fn pop_returns_none_when_stack_empty() {
+    // Given an empty stack.
+    let mut stack = Stack::default();
+
+    // When popping from the stack.
+    let item = stack.pop();
+
+    // Then we get nothing back.
+    assert!(item.is_none());
+}
+```
+
+#### Testing Intent Handlers
+
+```rust
+#[test]
+fn quit_sets_should_quit_in_state() {
+    // Given default app state.
+    let mut state = AppState::default();
+
+    // When handling Intent::Quit.
+    let result = IntentHandler::handle(&Intent::Quit, &mut state);
+
+    // Then should_quit is set to true.
+    assert!(state.should_quit);
+    // And no commands are emitted.
+    assert!(result.commands.is_empty());
+}
+```
+
+#### Testing Validators
+
+```rust
+#[test]
+fn submit_message_rejected_when_buffer_empty() {
+    // Given an empty input buffer.
+    let state = AppState::default();
+
+    // When validating submit message.
+    let result = validate_submit_message(&state);
+
+    // Then validation fails with EmptyBuffer.
+    assert!(matches!(result, Err(SubmitMessageError::EmptyBuffer)));
+}
+```
+
+#### Testing Domain Actors
+
+```rust
+#[test]
+fn stream_token_appends_to_assistant_entry() {
+    // Given a projector with an active session.
+    let state = State::new(AppState::default());
+    let sink = RecordingSink::new();
+    let session_actor = SessionPersistenceActor::activate(&mut ctx);
+
+    // When handling StreamToken("Hello").
+    session_actor.handle_stream_token(&StreamToken { /* ... */ }, &sink);
+
+    // Then the session has an Assistant entry with "Hello".
+    let s = state.read();
+    assert_eq!(s.active_session().last_entry_text(), "Hello");
+}
+```
+
+#### The Rule
+
+Every test has `// Given`, `// When`, `// Then` comments in that order.
+For simple cases, inline the sections. For complex setup, use helper functions or builders.
+The test name describes the behavior so it reads as a sentence in `cargo test` output.
+
+---
+
+### Observable Behavior Only - No Testing Internals
+
+Tests verify _what the system does_, not _how it does it_. If you can't test observable behavior,
+that's a design problem - create an abstraction, don't test internals.
+
+#### What to Test
+
+```rust
+// ✅ GOOD - test the public API
+#[test]
+fn save_then_load_roundtrips_session() {
+    // Given a session store.
+    let store = InMemorySessionStore::new();
+    let session = Session::new(SessionId::new());
+
+    // When saving and loading.
+    store.save(&session).expect("save");
+    let loaded = store.load(&session.id()).expect("load");
+
+    // Then the loaded session matches the original.
+    assert_eq!(loaded.unwrap().id(), session.id());
+}
+```
+
+#### What NOT to Test
+
+```rust
+// ❌ BAD - testing private methods
+#[test]
+fn internal_sort_uses_quickselect() {
+    let processor = Processor::new();
+    // Testing a private implementation detail.
+    // If the algorithm changes, this test breaks for no good reason.
+    assert_eq!(processor.internal_sort_order(), Algorithm::QuickSelect);
+}
+
+// ❌ BAD - testing struct field values directly
+#[test]
+fn parser_sets_is_compound_flag() {
+    let result = parse("compound expression");
+    // Coupled to internal representation.
+    assert!(result.is_compound);
+}
+```
+
+#### The Rule
+
+If the only way to test something is to inspect internal state, the type needs a
+semantic method that exposes the observable behavior. Ask: "if this implementation
+changed entirely, would this test still be valid?" If no, it's testing internals.
+
+---
+
+### Parameterized Tests with rstest
+
+When the same assertion logic applies to many inputs, use `rstest` to parameterize.
+Each `#[case]` must test the **same property** - do not use `rstest` to combine
+different behaviors into one test.
+
+#### The Pattern
+
+```rust
+#[rstest::rstest]
+#[case(Key::Tab, "Tab")]
+#[case(Key::Enter, "Enter")]
+#[case(Key::Esc, "Esc")]
+fn key_display(#[case] key: Key, #[case] expected: &str) {
+    assert_eq!(key.display(), expected);
+}
+```
+
+#### When NOT to Use rstest
+
+```rust
+// ❌ BAD - different behaviors crammed into cases
+#[rstest::rstest]
+#[case::empty("", Err(ParseError::Empty))]
+#[case::valid("abc", Ok(ParseResult { /* ... */ }))]
+fn parse(input: &str, expected: Result<ParseResult, ParseError>) { /* ... */ }
+// These test different behaviors (validation vs success).
+// Use two separate BDD-style tests.
+```
+
+#### The Rule
+
+Use `rstest` when the same assertion logic runs against different inputs.
+For edge cases that don't fit a simple expected value, prefer a standalone BDD test.
+
+---
+
+### Test Utilities
+
+#### Test Builders
+
+Create domain-specific builders for complex setup. Builders live in each feature's
+test module colocated per fake/struct. Prefer a shared test module for shared test features.
+
+```rust
+// ✅ GOOD - builder for test setup
+fn test_session() -> SessionBuilder {
+    SessionBuilder::new()
+        .with_id(SessionId::from(Uuid::new_v4()))
+        .with_entries(vec![ChatEntry::user("hello")])
+}
+
+fn test_session() -> Session {
+    test_session().build()
+}
+```
+
+#### Services Test Builder
+
+When the global context is trait-backed, tests swap the whole container — not each
+call site. Provide a single builder, gated behind a test feature, that defaults to
+fakes and overrides per test. This replaces every raw struct-literal construction of
+`Services`.
+
+```rust
+let svc = Services::test()
+    .registry_specs([LicenseSpec::new("MIT")])
+    .config(Config::default(), PathBuf::from("/proj"))
+    .build();   // defaults: FakeFs, FakeClock::fixed(0), empty registry
+```
